@@ -1,0 +1,85 @@
+# pet_dance 服务端（第 1–4 周）
+
+这一阶段提供 App 主路径和运营后台的模板草稿能力：
+
+- 手机号验证码登录、同意记录、新用户赠送点数、刷新令牌和注销
+- 未登录浏览已上架模板；提示词、模型和供应商不下发
+- 原图限时上传、创建任务、冻结点数、轮询状态、作品列表和删除
+- 任务状态 `queued → moderating → generating → muxing → succeeded`，失败或超时退回冻结点数
+- 当前 Worker 把模板预览片复制为成片，不调用图生视频
+- 员工用户名密码登录，模板草稿、上架、下架、排序和复制
+
+第 5–6 周再接可灵、审核、混音、支付、加油包、举报、概览和审计查询。维护开关已经会拒绝新任务，但还没有后台修改入口。
+
+## 本机直接跑
+
+当前仓库可以在没有 PostgreSQL 和 Redis 的机器上先把接口跑起来。在 `server` 目录执行：
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python -m pip install -e ".[dev]"
+$env:DATABASE_URL="sqlite+aiosqlite:///./var/pet_dance.db"
+$env:REDIS_URL="memory"
+$env:QUEUE_MODE="inline"
+$env:STORAGE_BACKEND="local"
+$env:STORAGE_PUBLIC_BASE="http://127.0.0.1:8080"
+.venv\Scripts\python -m app.seed
+.venv\Scripts\uvicorn app.main:app --reload --port 8080
+```
+
+种子数据会创建管理员 `admin` / `petdance-admin`，以及 8 条已上架模板。开发环境验证码固定为 `246810`。接口文档在 `http://127.0.0.1:8080/docs`。
+
+`QUEUE_MODE=inline` 会在 API 进程里把占位成片做完。正式部署用 `arq`，并另起 Worker：
+
+```powershell
+arq app.worker_settings.WorkerSettings
+```
+
+`PLACEHOLDER_STEP_SECONDS=1` 时，Worker 会逐段推进状态，客户端每 3 秒轮询能看到排队、生成中和合成中。默认 `0` 会在一次任务里走完这些状态。
+
+## Docker
+
+有 Docker 时，在 `server` 目录执行 `docker compose up --build`。接口在 `http://localhost:8080`。API 与 Worker 共用一个存储卷，数据库是 PostgreSQL 16，队列是 Redis 7。上线前把 `ENV=production`，对象存储改为 `STORAGE_BACKEND=oss`，并更换 JWT 密钥、管理员密码和短信配置。生产环境拒绝开发验证码、SQLite 和内存 Redis。
+
+## 测试
+
+```powershell
+.venv\Scripts\python -m pytest
+```
+
+## 点数
+
+新用户赠送 20 点，同一手机号只送一次，注销后再次注册不再赠送。创建任务时可用点数减少、冻结点数增加。成功后冻结转为实扣。失败、超时、维护前已创建的任务被取消时，冻结退回可用点数。同一笔冻结只结算一次。
+
+## App 接口
+
+| 方法 | 路径 | 登录 |
+|---|---|---|
+| GET | `/v1/meta` | 否 |
+| POST | `/v1/auth/sms` | 否 |
+| POST | `/v1/auth/login` | 否 |
+| POST | `/v1/auth/refresh` | 否 |
+| POST | `/v1/auth/logout` | 否 |
+| GET, PATCH, DELETE | `/v1/me` | 是 |
+| GET | `/v1/credits` | 是 |
+| GET | `/v1/templates` | 否 |
+| GET | `/v1/templates/{id}` | 否 |
+| POST | `/v1/uploads/image` | 是 |
+| POST, GET | `/v1/generations` | 是 |
+| GET, DELETE | `/v1/generations/{id}` | 是 |
+
+创建任务的正文只有 `template_id`、`image_key` 和 `ownership_confirmed`。图片先用上传地址 PUT 到对象存储。
+
+## 后台接口
+
+前缀 `/admin-api/v1`。App 令牌不能访问。
+
+| 方法 | 路径 |
+|---|---|
+| POST | `/auth/login` `/auth/refresh` `/auth/logout` |
+| GET, POST | `/templates` |
+| GET, PATCH | `/templates/{id}` |
+| POST | `/templates/{id}/duplicate` |
+| POST | `/uploads` |
+
+上传种类为 `cover`、`preview`、`audio`。模板保存为草稿不会出现在 App 里。上架前必须有封面、MP4 预览片和提示词。
